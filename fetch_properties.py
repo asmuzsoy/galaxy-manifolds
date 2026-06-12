@@ -13,6 +13,7 @@ Output: wide CSV. For each snapshot S the descendant/progenitor lives at, this
             m200_snap_<S>            (Group_M_Crit200 of parent FoF group)
             starmet_snap_<S>         (SubhaloStarMetallicity)
             gasmet_snap_<S>          (SubhaloGasMetallicity)
+            is_central_snap_<S>      (1 if SubfindID == GroupFirstSub of its FoF group, else 0)
 
 Units: all values are in TNG code units. Masses are in 1e10 Msun/h. SFR is
        in Msun/yr (no h dependence). Metallicities are mass fractions.
@@ -47,9 +48,10 @@ SUBHALO_FIELDS = [
     'SubhaloGasMetallicity',
     'SubhaloGrNr',
 ]
-GROUP_FIELDS = ['Group_M_Crit200']
+GROUP_FIELDS = ['Group_M_Crit200', 'GroupFirstSub']
 
-PROP_SUFFIXES = ['sfr', 'mass_stars', 'mass_total', 'm200', 'starmet', 'gasmet']
+PROP_SUFFIXES = ['sfr', 'mass_stars', 'mass_total', 'm200',
+                 'starmet', 'gasmet', 'is_central']
 
 
 def load_snapshot_props(basePath, snap):
@@ -59,14 +61,10 @@ def load_snapshot_props(basePath, snap):
     subs = il.groupcat.loadSubhalos(basePath, snap, fields=SUBHALO_FIELDS)
     print(f"  Loading FoF group catalog for snap {snap}...")
     grps = il.groupcat.loadHalos(basePath, snap, fields=GROUP_FIELDS)
-    # When loadHalos is given a single field, it returns the array directly
-    # rather than a dict. Handle both cases.
-    if isinstance(grps, dict):
-        m200_arr = grps['Group_M_Crit200']
-        n_grp = grps['count']
-    else:
-        m200_arr = grps
-        n_grp = len(grps)
+    # loadHalos with multiple fields returns a dict.
+    m200_arr = grps['Group_M_Crit200']
+    first_sub_arr = grps['GroupFirstSub']
+    n_grp = grps['count']
 
     return {
         'sfr': subs['SubhaloSFR'],
@@ -76,6 +74,7 @@ def load_snapshot_props(basePath, snap):
         'gasmet': subs['SubhaloGasMetallicity'],
         'grnr': subs['SubhaloGrNr'],
         'm200_by_group': m200_arr,
+        'first_sub_by_group': first_sub_arr,
         'n_sub': subs['count'],
         'n_grp': n_grp,
     }
@@ -90,8 +89,10 @@ def lookup(props, sid):
     grnr = int(props['grnr'][sid])
     if 0 <= grnr < n_grp:
         m200 = float(props['m200_by_group'][grnr])
+        is_central = int(sid == int(props['first_sub_by_group'][grnr]))
     else:
         m200 = ''
+        is_central = ''
     return [
         float(props['sfr'][sid]),
         float(props['mass_stars'][sid]),
@@ -99,6 +100,7 @@ def lookup(props, sid):
         m200,
         float(props['starmet'][sid]),
         float(props['gasmet'][sid]),
+        is_central,
     ]
 
 
