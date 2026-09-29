@@ -3,8 +3,11 @@ Match z=0 galaxies (from a saved embedding) to their main progenitors at one or
 more target snapshots using the local SubLink merger trees.
 
 Output: CSV with one row per z=0 galaxy and one column per target snapshot.
-Columns: [idx_z0, subfind_z0, subfind_snap_<S1>, subfind_snap_<S2>, ...]
+Columns: [idx_z0, subfind_z0, subfind_snap_<S1>, subfind_snap_<S2>, ..., has_tree]
 Empty cells indicate that the galaxy has no main progenitor at that snapshot.
+has_tree = 0 marks galaxies with no SubLink tree at all (completely DM-stripped
+satellites, an environmentally biased class) as opposed to trees that merely
+terminate before the target snapshot.
 
 Example:
     # Single target snapshot
@@ -66,33 +69,90 @@ def verify_positions(basePath, output_path, target_snapshots, n_sample, seed=42)
             continue
         print(f"\nVerifying {len(matched_rows)} pairs for snap {target} "
               f"(positions in ckpc/h, box={BOX_CKPC:.0f}):")
-        print(f"{'sid_z0':>10} {'sid_prog':>10} {'dist (ckpc/h)':>14}")
+        print(f"{'sid_z0':>10} {'sid_prog':>10} {'dist (ckpc/h)':>14}  check")
         distances = []
+        mismatches = 0
         for row in matched_rows:
             sid_z0 = int(row['subfind_z0'])
+            csv_prog = int(float(row[col]))
             tree = load_mpb(basePath, sid_z0,
                             fields=['SnapNum', 'SubfindID', 'SubhaloPos'])
             if tree is None:
+                print(f"{sid_z0:>10} {csv_prog:>10} {'--':>14}  MISMATCH "
+                      f"(CSV has a progenitor but no tree exists)")
+                mismatches += 1
                 continue
             snaps = list(tree['SnapNum'])
             i0 = snaps.index(SNAP_Z0)
+            if target not in snaps:
+                print(f"{sid_z0:>10} {csv_prog:>10} {'--':>14}  MISMATCH "
+                      f"(tree has no snap {target})")
+                mismatches += 1
+                continue
             it = snaps.index(target)
+            tree_prog = int(tree['SubfindID'][it])
+            # The actual content check: the CSV cell must equal the tree's MPB entry.
+            ok = (csv_prog == tree_prog)
+            if not ok:
+                mismatches += 1
             d = periodic_distance(tree['SubhaloPos'][i0],
                                   tree['SubhaloPos'][it], BOX_CKPC)
             distances.append(d)
-            print(f"{sid_z0:>10} {int(row[col]):>10} {d:>14.0f}")
+            print(f"{sid_z0:>10} {csv_prog:>10} {d:>14.0f}  "
+                  f"{'OK' if ok else f'MISMATCH (tree says {tree_prog})'}")
         if distances:
             d = np.array(distances)
             print(f"  summary: median={np.median(d):.0f}, min={d.min():.0f}, "
                   f"max={d.max():.0f} ckpc/h")
+        print(f"  content check: {mismatches} mismatch(es) out of {len(matched_rows)} sampled")
 
 
 def load_done(path):
-    if not os.path.exists(path):
-        return set()
+    """Return ({subfind_z0 already written}, [(idx_z0, subfind_z0) pairs]).
+
+    Tolerant of a truncated final line (DictReader may yield None values there);
+    such rows are simply not counted as done.
+    """
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return set(), []
+    pairs = []
     with open(path, 'r', newline='') as f:
-        return {int(r['subfind_z0']) for r in csv.DictReader(f)
-                if r.get('subfind_z0', '').isdigit()}
+        for r in csv.DictReader(f):
+            sid = r.get('subfind_z0') or ''
+            idx = r.get('idx_z0') or ''
+            if sid.isdigit() and idx.isdigit():
+                pairs.append((int(idx), int(sid)))
+    return {sid for _, sid in pairs}, pairs
+
+
+def check_resume_file(path, header, orig_z0, done_pairs):
+    """Refuse to append to an existing output that doesn't match this run.
+
+    Guards three documented silent-corruption paths: a different --target_snapshots
+    header (columns would be misaligned), a different --z0_embedding sample (idx_z0
+    would be misaligned), and a truncated final line from a killed run (the next
+    append would splice onto it).
+    """
+    with open(path, 'r', newline='') as f:
+        first = f.readline().rstrip('\r\n')
+        last = first
+        for line in f:
+            if line.strip():
+                last = line.rstrip('\r\n')
+    if first.split(',') != header:
+        sys.exit(f"Existing {path} has header\n  {first}\nbut this run would write\n"
+                 f"  {','.join(header)}\nAppending would misalign columns. "
+                 f"Use a new --output (or delete the old file).")
+    if last != first and len(last.split(',')) != len(header):
+        sys.exit(f"The final line of {path} is incomplete (killed mid-write?):\n"
+                 f"  {last!r}\nDelete that partial line, then resume.")
+    for idx, sid in done_pairs:
+        if idx >= len(orig_z0) or int(orig_z0[idx]) != sid:
+            expect = int(orig_z0[idx]) if idx < len(orig_z0) else 'out of range'
+            sys.exit(f"Resume mismatch: existing row (idx_z0={idx}, subfind_z0={sid}) "
+                     f"does not match the current --z0_embedding (expected subfind "
+                     f"{expect}). The existing CSV came from a different sample; "
+                     f"write to a new --output.")
 
 
 def main():
@@ -135,14 +195,22 @@ def main():
         orig_z0 = orig_z0[:args.limit]
     print(f"  {len(orig_z0)} z=0 galaxies, target snapshots: {targets}")
 
-    done = load_done(args.output)
+    done, done_pairs = load_done(args.output)
     if done:
         print(f"Resuming: {len(done)} already in {args.output}")
 
-    new_file = not os.path.exists(args.output)
+    # has_tree: 1 if the galaxy has a SubLink tree at all, 0 otherwise. Distinguishes
+    # "no tree" (the ~238 DM-stripped cluster-core satellites -- an environmentally
+    # biased class) from "tree exists but terminates before the target snapshot";
+    # both otherwise look like blank progenitor cells.
+    header = ['idx_z0', 'subfind_z0'] + [f'subfind_snap_{t}' for t in targets] + ['has_tree']
+    # A zero-byte file (crashed run, stray touch) must be treated as new, or the
+    # header is skipped and the first data row gets consumed as a header downstream.
+    new_file = (not os.path.exists(args.output)) or os.path.getsize(args.output) == 0
+    if not new_file:
+        check_resume_file(args.output, header, orig_z0, done_pairs)
     f = open(args.output, 'a', newline='')
     writer = csv.writer(f)
-    header = ['idx_z0', 'subfind_z0'] + [f'subfind_snap_{t}' for t in targets]
     if new_file:
         writer.writerow(header)
         f.flush()
@@ -160,6 +228,7 @@ def main():
             row = [idx, sid]
             if tree is None:
                 row.extend([''] * len(targets))
+                row.append(0)          # has_tree
             else:
                 snaps = list(tree['SnapNum'])
                 sids = tree['SubfindID']
@@ -170,6 +239,7 @@ def main():
                         matched_per_snap[t] += 1
                     else:
                         row.append('')
+                row.append(1)          # has_tree
             writer.writerow(row)
             processed += 1
             if processed % args.save_every == 0:

@@ -124,11 +124,16 @@ def compute_embedding(subhalos, threshold=5, n_components=10):
     evals = evals[order]
     evecs = evecs[:, order]
 
-    # Scale by sqrt of eigenvalues
-    embedding = evecs * np.sqrt(evals)
+    # Scale by sqrt of eigenvalues. B is PSD in exact arithmetic, but ARPACK can
+    # return a trailing eigenvalue as a tiny negative; clip so sqrt cannot emit NaN.
+    if (evals < -1e-10 * max(float(evals.max()), 1e-300)).any():
+        print(f"  WARNING: significantly negative eigenvalue(s): {evals[evals < 0]}")
+    embedding = evecs * np.sqrt(np.clip(evals, 0, None))
 
     print(f"Embedding shape: {embedding.shape}")
-    print(f"Explained variance (first 3): {np.sum(evals[:3]) / np.sum(evals) * 100:.1f}%")
+    print(f"Top-3 share of the {len(evals)} computed eigenvalues: "
+          f"{np.sum(evals[:3]) / np.sum(evals) * 100:.1f}% "
+          f"(NOT variance explained; the full spectrum is not computed)")
 
     return embedding, sorted_neighbors
 
