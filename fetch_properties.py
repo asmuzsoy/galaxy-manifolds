@@ -89,6 +89,11 @@ def lookup(props, sid):
     grnr = int(props['grnr'][sid])
     if 0 <= grnr < n_grp:
         m200 = float(props['m200_by_group'][grnr])
+        # Group_M_Crit200 == 0 means the SO mass is UNDEFINED for this group
+        # (common for tiny FoF groups), not a measured zero -- write blank so a
+        # downstream log10 cannot silently produce -inf.
+        if m200 == 0.0:
+            m200 = ''
         is_central = int(sid == int(props['first_sub_by_group'][grnr]))
     else:
         m200 = ''
@@ -125,12 +130,26 @@ def main():
         rows = list(reader)
     print(f"  {len(rows)} rows")
 
+    # Guard against mixed-schema/truncated inputs (e.g. a CSV resumed with a
+    # different --target_snapshots list). Long rows collect extras under the key
+    # None; short rows get None values, which would silently read as "unmatched".
+    if any(r.get(None) for r in rows):
+        sys.exit("ERROR: some input rows have MORE fields than the header "
+                 "(mixed-schema CSV?). Regenerate the progenitors CSV.")
+    n_short = sum(1 for r in rows if any(v is None for v in r.values()))
+    if n_short:
+        print(f"  WARNING: {n_short} rows have FEWER fields than the header "
+              f"(truncated or mixed-schema input?); their missing cells will be "
+              f"treated as unmatched")
+
     # Identify snapshot columns available in the input
     snap_cols = [c for c in in_fieldnames if c.startswith('subfind_snap_')]
     available_snaps = {int(c.replace('subfind_snap_', '')) for c in snap_cols}
 
     if args.snapshots is not None:
-        snaps = sorted(set(args.snapshots))
+        # snap 99 is always included, as the docstring promises -- without this,
+        # an explicit --snapshots list silently dropped every *_snap_99 column.
+        snaps = sorted(set(args.snapshots) | {SNAP_Z0})
         missing = [s for s in snaps if s != SNAP_Z0 and s not in available_snaps]
         if missing:
             print(f"  WARNING: requested snapshots not in input CSV: {missing} "
@@ -166,7 +185,8 @@ def main():
                 if sid_str in ('', None):
                     vals = [''] * len(PROP_SUFFIXES)
                 else:
-                    vals = lookup(all_props[s], int(sid_str))
+                    # int(float(...)): pandas round-trips write IDs as e.g. "4734.0"
+                    vals = lookup(all_props[s], int(float(sid_str)))
                 for suf, v in zip(PROP_SUFFIXES, vals):
                     out[f'{suf}_snap_{s}'] = v
             writer.writerow(out)
